@@ -89,7 +89,18 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_transform = ModerateDataTransform(noise_std=args.noise_std, mask_ratio=args.mask_ratio)
+    use_soft_hrf = args.cross_alignment_mode == "soft_hrf"
+    query_duration_sec = 100 / args.nirs_sample_rate
+    expected_context_shape = (
+        args.in_channels_eeg,
+        int(round((args.offline_eeg_history_sec + query_duration_sec) * args.eeg_sample_rate)),
+    )
+    eeg_context_key = args.eeg_context_key if use_soft_hrf else None
+    train_transform = ModerateDataTransform(
+        noise_std=args.noise_std,
+        mask_ratio=args.mask_ratio,
+        time_shift_max_sec=args.time_shift_max_sec,
+    )
     train_set = ShinMultimodalDataset(
         args.data_path,
         train=True,
@@ -98,6 +109,10 @@ def main(args):
         split_mode=args.split_mode,
         split_seed=args.split_seed,
         subject_gap=args.subject_gap,
+        eeg_context_key=eeg_context_key,
+        expected_eeg_context_shape=expected_context_shape if use_soft_hrf else None,
+        eeg_sample_rate=args.eeg_sample_rate,
+        nirs_sample_rate=args.nirs_sample_rate,
     )
     test_set = ShinMultimodalDataset(
         args.data_path,
@@ -107,6 +122,10 @@ def main(args):
         split_mode=args.split_mode,
         split_seed=args.split_seed,
         subject_gap=args.subject_gap,
+        eeg_context_key=eeg_context_key,
+        expected_eeg_context_shape=expected_context_shape if use_soft_hrf else None,
+        eeg_sample_rate=args.eeg_sample_rate,
+        nirs_sample_rate=args.nirs_sample_rate,
     )
 
     generator = torch.Generator()
@@ -159,6 +178,13 @@ def main(args):
         nirs_hb_branch_mode=args.nirs_hb_branch_mode,
         hb_split_scale_init=args.hb_split_scale_init,
         hb_logit_scale_init=args.hb_logit_scale_init,
+        eeg_sample_rate=args.eeg_sample_rate,
+        nirs_sample_rate=args.nirs_sample_rate,
+        offline_eeg_history_sec=args.offline_eeg_history_sec,
+        hrf_lag_max_sec=args.hrf_lag_max_sec,
+        hrf_lag_bin_sec=args.hrf_lag_bin_sec,
+        hrf_prior_mean_sec=args.hrf_prior_mean_sec,
+        hrf_prior_std_sec=args.hrf_prior_std_sec,
     ).to(device)
 
     if args.checkpoint_path.lower() in {"", "none", "null"}:
@@ -237,19 +263,33 @@ def main(args):
         correct, total = 0, 0
         cur_mixup_alpha = args.stage1_mixup_alpha if in_stage1 else args.mixup_alpha
 
-        for x_eeg, x_nirs, y in train_loader:
+        for batch in train_loader:
+            if use_soft_hrf:
+                x_eeg, x_nirs, eeg_context, y = batch
+                eeg_context = eeg_context.to(device)
+            else:
+                x_eeg, x_nirs, y = batch
+                eeg_context = None
             x_eeg, x_nirs, y = x_eeg.to(device), x_nirs.to(device), y.to(device)
             optimizer.zero_grad()
-            mixed_x_eeg, mixed_x_nirs, y_a, y_b, lam = mixup_data(
-                x_eeg, x_nirs, y, alpha=cur_mixup_alpha, device=device
-            )
+            if use_soft_hrf:
+                mixed_x_eeg, mixed_x_nirs, y_a, y_b, lam, mix_index = mixup_data(
+                    x_eeg, x_nirs, y, alpha=cur_mixup_alpha, device=device, return_index=True
+                )
+                mixed_eeg_context = lam * eeg_context + (1 - lam) * eeg_context[mix_index, :]
+            else:
+                mixed_x_eeg, mixed_x_nirs, y_a, y_b, lam = mixup_data(
+                    x_eeg, x_nirs, y, alpha=cur_mixup_alpha, device=device
+                )
+                mixed_eeg_context = None
+            model_kwargs = {"eeg_context": mixed_eeg_context} if use_soft_hrf else {}
             use_aux_loss = (
                 args.aux_eeg_loss_weight > 0 or args.aux_nirs_loss_weight > 0
                 or args.aux_hbo_loss_weight > 0 or args.aux_hbr_loss_weight > 0
             )
             if use_aux_loss:
                 logits, logits_eeg, logits_nirs, logits_hbo, logits_hbr = model(
-                    mixed_x_eeg, mixed_x_nirs, return_aux=True
+                    mixed_x_eeg, mixed_x_nirs, return_aux=True, **model_kwargs
                 )
                 main_loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
                 eeg_aux_loss = mixup_criterion(criterion, logits_eeg, y_a, y_b, lam)
@@ -264,13 +304,16 @@ def main(args):
                     + args.aux_hbr_loss_weight * hbr_aux_loss
                 )
             else:
-                logits = model(mixed_x_eeg, mixed_x_nirs)
+                logits = model(mixed_x_eeg, mixed_x_nirs, **model_kwargs)
                 main_loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
                 eeg_aux_loss = logits.new_tensor(0.0)
                 nirs_aux_loss = logits.new_tensor(0.0)
                 hbo_aux_loss = logits.new_tensor(0.0)
                 hbr_aux_loss = logits.new_tensor(0.0)
                 loss = main_loss
+
+            hrf_smoothness_loss = model.hrf_lag_smoothness_loss() if use_soft_hrf else logits.new_tensor(0.0)
+            loss = loss + args.hrf_lag_smoothness_weight * hrf_smoothness_loss
 
             loss.backward()
             optimizer.step()
@@ -293,15 +336,28 @@ def main(args):
         model.eval()
         t_correct, t_total = 0, 0
         with torch.no_grad():
-            for x_eeg, x_nirs, y in test_loader:
+            for batch in test_loader:
+                if use_soft_hrf:
+                    x_eeg, x_nirs, eeg_context, y = batch
+                    eeg_context = eeg_context.to(device)
+                else:
+                    x_eeg, x_nirs, y = batch
+                    eeg_context = None
                 x_eeg, x_nirs, y = x_eeg.to(device), x_nirs.to(device), y.to(device)
-                t_correct += (model(x_eeg, x_nirs).argmax(1) == y).sum().item()
+                model_kwargs = {"eeg_context": eeg_context} if use_soft_hrf else {}
+                t_correct += (model(x_eeg, x_nirs, **model_kwargs).argmax(1) == y).sum().item()
                 t_total += y.size(0)
 
         test_acc = 100 * t_correct / t_total
         scheduler.step(test_acc)
         lrs = {group["name"]: group["lr"] for group in optimizer.param_groups}
         stage_name = "S1" if in_stage1 else "S2"
+        lag_summary = ""
+        if use_soft_hrf:
+            lag_summary = " | ".join(
+                f"Lag{branch}:{(probabilities * torch.arange(probabilities.numel(), device=probabilities.device, dtype=probabilities.dtype) * args.hrf_lag_bin_sec).sum().item():.2f}s"
+                for branch, probabilities in model.hrf_lag_probabilities().items()
+            )
         print(
             f"Epoch [{epoch + 1}/{args.epochs}] [{stage_name}] "
             f"LR(E):{lrs['EEG']:.1e} LR(A):{lrs['Adapter']:.1e} "
@@ -314,6 +370,7 @@ def main(args):
             f"AuxHbO:{total_hbo_aux_loss / len(train_loader):.4f} "
             f"AuxHbR:{total_hbr_aux_loss / len(train_loader):.4f} "
             f"| TrAcc: {train_acc:.2f}% | TeAcc: {test_acc:.2f}%"
+            f"{(' | ' + lag_summary) if lag_summary else ''}"
         )
 
         if test_acc > best_acc:

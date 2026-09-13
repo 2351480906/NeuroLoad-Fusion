@@ -50,6 +50,23 @@ keys:
 }
 ```
 
+Offline HRF-prior alignment additionally requires a real EEG history buffer;
+it does not synthesize history from the legacy 10-second EEG window:
+
+```python
+{
+    "X_eeg": numpy.ndarray,          # (30, 2000), current [t, t + 10 s] EEG
+    "X_eeg_context": numpy.ndarray,  # (30, 3600), EEG over [t - 8 s, t + 10 s]
+    "X_nirs": numpy.ndarray,         # (36, 100), current [t, t + 10 s] fNIRS
+    "y": int,
+}
+```
+
+Use it with `--cross_alignment_mode soft_hrf`. The mode keeps the existing
+10-second EEG branch for classification and uses `X_eeg_context` only as
+time-safe cross-attention keys and values. `local` remains the legacy
+fixed-delay baseline.
+
 For the default `block` fNIRS layout, the first 18 channels are HbO and the
 last 18 channels are HbR.
 
@@ -69,6 +86,17 @@ python run_multimodal_v14.py \
   --cross_fusion_mode logit \
   --hb_logit_scale_init 0.02 \
   --save_path checkpoints/neuroload_fusion_v14.pth
+```
+
+For offline HRF-prior alignment, add:
+
+```bash
+--cross_alignment_mode soft_hrf \
+--offline_eeg_history_sec 8 \
+--hrf_lag_max_sec 8 \
+--hrf_lag_bin_sec 0.5 \
+--hrf_prior_mean_sec 5 \
+--hrf_prior_std_sec 1.5
 ```
 
 The script first freezes the EEG encoder for `--stage1_epochs`, then unfreezes

@@ -8,10 +8,11 @@ from torch.utils.data import Dataset
 
 
 class ModerateDataTransform:
-    def __init__(self, noise_std=0.02, mask_ratio=0.05, shift_max=5):
+    def __init__(self, noise_std=0.02, mask_ratio=0.05, shift_max=0, time_shift_max_sec=0.0):
         self.noise_std = noise_std
         self.mask_ratio = mask_ratio
         self.shift_max = shift_max
+        self.time_shift_max_sec = time_shift_max_sec
 
     def __call__(self, x):
         if self.shift_max > 0:
@@ -28,8 +29,44 @@ class ModerateDataTransform:
                 x[:, start:start + mask_len] = 0.0
         return x
 
+    @staticmethod
+    def _shift_without_wrap(x, shift):
+        if shift == 0:
+            return x
+        shifted = torch.zeros_like(x)
+        if shift > 0:
+            shifted[:, shift:] = x[:, :-shift]
+        else:
+            shifted[:, :shift] = x[:, -shift:]
+        return shifted
 
-def mixup_data(x_eeg, x_nirs, y, alpha=0.4, device="cuda"):
+    def _apply_noise_and_mask(self, x):
+        if self.noise_std > 0:
+            x = x + torch.randn_like(x) * self.noise_std
+        if self.mask_ratio > 0:
+            time_steps = x.shape[1]
+            mask_len = int(time_steps * self.mask_ratio)
+            if mask_len > 0:
+                start = np.random.randint(0, time_steps - mask_len)
+                x[:, start:start + mask_len] = 0.0
+        return x
+
+    def apply_pair(self, x_eeg, x_nirs, eeg_sample_rate, nirs_sample_rate, eeg_context=None):
+        if self.time_shift_max_sec > 0:
+            shift_sec = np.random.uniform(-self.time_shift_max_sec, self.time_shift_max_sec)
+            x_eeg = self._shift_without_wrap(x_eeg, int(round(shift_sec * eeg_sample_rate)))
+            x_nirs = self._shift_without_wrap(x_nirs, int(round(shift_sec * nirs_sample_rate)))
+            if eeg_context is not None:
+                eeg_context = self._shift_without_wrap(eeg_context, int(round(shift_sec * eeg_sample_rate)))
+
+        x_eeg = self._apply_noise_and_mask(x_eeg)
+        x_nirs = self._apply_noise_and_mask(x_nirs)
+        if eeg_context is None:
+            return x_eeg, x_nirs
+        return x_eeg, x_nirs, self._apply_noise_and_mask(eeg_context)
+
+
+def mixup_data(x_eeg, x_nirs, y, alpha=0.4, device="cuda", return_index=False):
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -39,6 +76,8 @@ def mixup_data(x_eeg, x_nirs, y, alpha=0.4, device="cuda"):
     mixed_x_eeg = lam * x_eeg + (1 - lam) * x_eeg[index, :]
     mixed_x_nirs = lam * x_nirs + (1 - lam) * x_nirs[index, :]
     y_a, y_b = y, y[index]
+    if return_index:
+        return mixed_x_eeg, mixed_x_nirs, y_a, y_b, lam, index
     return mixed_x_eeg, mixed_x_nirs, y_a, y_b, lam
 
 
@@ -48,7 +87,9 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 
 class ShinMultimodalDataset(Dataset):
     def __init__(self, root_path, train=True, split_ratio=0.8, transform=None,
-                 shuffle_data=False, split_mode="file", split_seed=42, subject_gap=0):
+                 shuffle_data=False, split_mode="file", split_seed=42, subject_gap=0,
+                 eeg_context_key=None, expected_eeg_context_shape=None,
+                 eeg_sample_rate=200.0, nirs_sample_rate=10.0):
         self.files = []
         all_files = [f for f in os.listdir(root_path) if f.endswith(".pkl")]
         if split_mode == "subject":
@@ -67,6 +108,10 @@ class ShinMultimodalDataset(Dataset):
             self.file_list = all_files[:split_idx] if train else all_files[split_idx:]
         self.root_path = root_path
         self.transform = transform
+        self.eeg_context_key = eeg_context_key
+        self.expected_eeg_context_shape = expected_eeg_context_shape
+        self.eeg_sample_rate = eeg_sample_rate
+        self.nirs_sample_rate = nirs_sample_rate
 
     def __len__(self):
         return len(self.file_list)
@@ -85,9 +130,31 @@ class ShinMultimodalDataset(Dataset):
         y = torch.tensor(data["y"]).long()
         x_eeg = self.normalize(x_eeg)
         x_nirs = self.normalize(x_nirs)
+        eeg_context = None
+        if self.eeg_context_key is not None:
+            if self.eeg_context_key not in data:
+                raise KeyError(f"Missing required EEG context key '{self.eeg_context_key}' in {path}.")
+            eeg_context = torch.from_numpy(data[self.eeg_context_key]).float()
+            if self.expected_eeg_context_shape is not None and tuple(eeg_context.shape) != tuple(self.expected_eeg_context_shape):
+                raise ValueError(
+                    f"Expected {self.eeg_context_key} shape {self.expected_eeg_context_shape}, "
+                    f"got {tuple(eeg_context.shape)} in {path}."
+                )
+            eeg_context = self.normalize(eeg_context)
         if self.transform:
-            x_eeg = self.transform(x_eeg)
-            x_nirs = self.transform(x_nirs)
+            transformed = self.transform.apply_pair(
+                x_eeg,
+                x_nirs,
+                eeg_sample_rate=self.eeg_sample_rate,
+                nirs_sample_rate=self.nirs_sample_rate,
+                eeg_context=eeg_context,
+            )
+            if eeg_context is None:
+                x_eeg, x_nirs = transformed
+            else:
+                x_eeg, x_nirs, eeg_context = transformed
+        if eeg_context is not None:
+            return x_eeg, x_nirs, eeg_context, y
         return x_eeg, x_nirs, y
 
 

@@ -209,6 +209,32 @@ class BIOTEncoder(nn.Module):
         emb = torch.cat(emb_seq, dim=1)
         return self.transformer(emb)
 
+    def forward_lag_tokens(self, x, sample_rate, n_channel_offset=0):
+        """Return time-major EEG tokens before cross-frame self-attention.
+
+        These tokens are reserved for delay-aware cross-modal keys/values. They
+        intentionally bypass ``self.transformer`` so a permitted historical EEG
+        token cannot already contain information from later EEG frames.
+        """
+        channel_sequences = []
+        for i in range(x.shape[1]):
+            channel_spec_emb = self.stft(x[:, i : i + 1, :])
+            channel_spec_emb = self.patch_embedding(channel_spec_emb)
+            batch_size, ts, _ = channel_spec_emb.shape
+            channel_token_emb = (
+                self.channel_tokens(self.index[i + n_channel_offset])
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .repeat(batch_size, ts, 1)
+            )
+            channel_sequences.append(self.positional_encoding(channel_spec_emb + channel_token_emb))
+
+        tokens = torch.stack(channel_sequences, dim=2).reshape(x.size(0), -1, self.channel_tokens.embedding_dim)
+        frame_times = (
+            torch.arange(ts, device=x.device, dtype=tokens.dtype) * self.hop_length + self.n_fft / 2
+        ) / float(sample_rate)
+        return tokens, frame_times.repeat_interleave(x.shape[1])
+
 
 # supervised classifier module
 class BIOTClassifier(nn.Module):

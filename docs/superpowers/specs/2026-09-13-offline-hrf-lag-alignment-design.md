@@ -17,6 +17,7 @@ path can reuse the same lag representation with a ring buffer.
 Each offline sample has a query interval `[t, t + 10 s]`:
 
 ```text
+X_eeg: (30, 2000), sampled at 200 Hz over [t, t + 10 s]
 X_nirs_query: (36, 100), sampled at 10 Hz over [t, t + 10 s]
 X_eeg_context: (30, 3600), sampled at 200 Hz over [t - 8 s, t + 10 s]
 ```
@@ -29,8 +30,9 @@ start. fNIRS temporal token centres are nominally derived from the fourfold
 pooling stride. Boundary padding or missing history is represented by a valid
 mask, never by a circular shift or a fallback key.
 
-The legacy `(30, 2000)` EEG input remains available only in legacy alignment
-mode. The HRF-prior alignment mode requires the extended EEG context.
+`X_eeg` remains the input to the existing Transformer-backed EEG classifier
+branch. The HRF-prior alignment mode additionally requires the extended
+`X_eeg_context` key; it is used only as delay-alignment keys and values.
 
 ## EEG Token Contract
 
